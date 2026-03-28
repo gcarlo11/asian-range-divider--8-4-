@@ -1,0 +1,301 @@
+//@version=6
+indicator("Asia Range Divider [8 Levels]", overlay=true,
+          max_lines_count=500, max_labels_count=400, max_boxes_count=20)
+
+var string G_SESS = "📅 Asia Session"
+i_sess_time  = input.string("0700-1500", "Session Time (GMT+7)",
+               group=G_SESS, tooltip="Format: HHMM-HHMM  |  Default = 07:00–15:00 GMT+7")
+i_show_lvls  = input.bool(true,  "Show Levels",       group=G_SESS)
+i_show_box   = input.bool(true,  "Show Session Box",  group=G_SESS)
+
+var string G_FILT = "⚙️ Confirmation Filters"
+i_use_vol   = input.bool(true,  "Volume Filter",             group=G_FILT)
+i_vol_len   = input.int(20,     "Volume MA Length",           group=G_FILT, minval=1)
+i_use_atr   = input.bool(true,  "ATR Filter",                group=G_FILT)
+i_atr_len   = input.int(14,     "ATR Length",                group=G_FILT, minval=1)
+i_atr_thr   = input.float(0.0,  "ATR Min Threshold (0=auto)", group=G_FILT, minval=0,
+               step=0.00001, tooltip="0 = half of 50-bar ATR SMA (auto-adaptive)")
+i_use_rsi   = input.bool(true,  "RSI Filter",                group=G_FILT)
+i_rsi_len   = input.int(14,     "RSI Length",                group=G_FILT, minval=1)
+
+var string G_VIS = "🎨 Visuals"
+i_debug     = input.bool(false, "Debug Mode (Info Table)", group=G_VIS)
+
+//  S E S S I O N   D E T E C T I O N   (GMT+7 / UTC+7)
+// time() returns na when NOT in session → negate to get a boolean
+bool in_asia    = not na(time(timeframe.period, i_sess_time, "UTC+7"))
+bool asia_start = in_asia  and not in_asia[1]  // first bar of session
+bool asia_end   = not in_asia and  in_asia[1]  // first bar after session closes
+
+//  S E S S I O N   H I G H  /  L O W   ( D Y N A M I C )
+var float sess_hi = na
+var float sess_lo = na
+
+if asia_start
+    // Reset at the start of every new session
+    sess_hi := high
+    sess_lo := low
+else if in_asia
+    sess_hi := math.max(sess_hi, high)
+    sess_lo := math.min(sess_lo, low)
+
+//  L O C K E D   L E V E L S   ( 9 prices, set once at session end )
+var float lk_hi = na     // locked Asia High
+var float lk_lo = na     // locked Asia Low
+
+//  lv0 = Asia Low (L0) … lv8 = Asia High (L8)
+var float lv0 = na
+var float lv1 = na
+var float lv2 = na
+var float lv3 = na
+var float lv4 = na
+var float lv5 = na
+var float lv6 = na
+var float lv7 = na
+var float lv8 = na
+
+if asia_end
+    lk_hi := sess_hi
+    lk_lo := sess_lo
+    float step = (lk_hi - lk_lo) / 8.0
+    lv0 := lk_lo
+    lv1 := lk_lo + step * 1
+    lv2 := lk_lo + step * 2
+    lv3 := lk_lo + step * 3
+    lv4 := lk_lo + step * 4
+    lv5 := lk_lo + step * 5
+    lv6 := lk_lo + step * 6
+    lv7 := lk_lo + step * 7
+    lv8 := lk_hi
+
+// ── Helper: get a level price by index (0–8) 
+f_get_lvl(int idx) =>
+    switch idx
+        0 => lv0
+        1 => lv1
+        2 => lv2
+        3 => lv3
+        4 => lv4
+        5 => lv5
+        6 => lv6
+        7 => lv7
+        8 => lv8
+        => float(na)
+
+// ── Helper: supply / demand color coding 
+//   L6–L8  → Supply zone  (red)
+//   L0–L2  → Demand zone  (green)
+//   L3–L5  → Neutral      (gray)
+f_lvl_color(int idx) =>
+    idx >= 6 ? color.new(#FF4444, 0) :
+     idx <= 2 ? color.new(#00CC66, 0) :
+     color.new(#AAAAAA, 40)
+
+//  S E S S I O N   B O X   ( orange highlight during Asia hours )
+var box asia_box = na
+
+if i_show_box
+    if asia_start
+        box.delete(asia_box)
+        asia_box := box.new(bar_index, high, bar_index + 1, low,
+                            border_color = color.new(#FF9800, 30),
+                            bgcolor      = color.new(#FF9800, 88),
+                            border_width = 1)
+    if in_asia and not na(asia_box)
+        box.set_right(asia_box, bar_index + 1)
+        box.set_top(asia_box, sess_hi)
+        box.set_bottom(asia_box, sess_lo)
+
+//  D R A W   H O R I Z O N T A L   L E V E L S
+//  Deletes previous session's lines/labels and redraws on every asia_end
+var line[]  lvl_lines  = array.new_line()
+var label[] lvl_labels = array.new_label()
+
+if asia_end and i_show_lvls
+    // ── Purge previous session drawings ──
+    for ln in lvl_lines
+        line.delete(ln)
+    array.clear(lvl_lines)
+
+    for lb in lvl_labels
+        label.delete(lb)
+    array.clear(lvl_labels)
+
+    // ── Draw 9 levels (L0 … L8) ──
+    for i = 0 to 8
+        float  lvl  = f_get_lvl(i)
+        color  c    = f_lvl_color(i)
+        bool   is_boundary = (i == 0 or i == 8)
+
+        string zone_tag = i >= 6 ? " ▲ Supply" :
+                           i <= 2 ? " ▼ Demand" :
+                           " ● Mid"
+        string lbl_text = i == 0 ? "L0 — Asia Low"  + zone_tag :
+                           i == 8 ? "L8 — Asia High" + zone_tag :
+                           "L" + str.tostring(i) + zone_tag
+
+        // Horizontal line (extends to the right of the chart)
+        line ln = line.new(
+             x1     = bar_index,
+             y1     = lvl,
+             x2     = bar_index + 1,
+             y2     = lvl,
+             color  = c,
+             width  = is_boundary ? 2 : 1,
+             style  = is_boundary ? line.style_solid : line.style_dashed,
+             extend = extend.right)
+        array.push(lvl_lines, ln)
+
+        // Label on the right side of each line
+        label lb = label.new(
+             x         = bar_index + 3,
+             y         = lvl,
+             text      = lbl_text,
+             color     = color.new(c, 75),
+             textcolor = c,
+             style     = label.style_label_right,
+             size      = size.small)
+        array.push(lvl_labels, lb)
+
+//  I N D I C A T O R   C A L C U L A T I O N S
+float rsi_val = ta.rsi(close, i_rsi_len)
+float atr_val = ta.atr(i_atr_len)
+float vol_ma  = ta.sma(volume, i_vol_len)
+
+// Auto ATR threshold = 50% of the 50-bar ATR average (adapts to volatility)
+float atr_auto = ta.sma(atr_val, 50) * 0.5
+float atr_thr  = i_atr_thr > 0.0 ? i_atr_thr : atr_auto
+
+//  C O N F I R M A T I O N   F I L T E R S
+// Each filter can be toggled off — if disabled it always returns true
+bool vol_ok    = not i_use_vol or (volume > vol_ma)
+bool atr_ok    = not i_use_atr or (atr_val > atr_thr)
+bool rsi_long  = not i_use_rsi or (rsi_val > 50)
+bool rsi_short = not i_use_rsi or (rsi_val < 50)
+
+bool confirm_long  = vol_ok and atr_ok and rsi_long   // all filters pass → BUY
+bool confirm_short = vol_ok and atr_ok and rsi_short  // all filters pass → SELL
+
+//  S I G N A L   L O G I C   ( only fires POST-session )
+//  post_session = true after Asia closes AND valid levels exist
+bool  post_session = not in_asia and not na(lk_hi)
+
+bool  buy_sig     = false
+bool  sell_sig    = false
+float buy_target  = na     // next level above
+float sell_target = na     // next level below
+
+if post_session
+    for i = 0 to 8
+        float lvl = f_get_lvl(i)
+        if not na(lvl)
+            // Manual cross detection avoids series-history issues in loops
+            bool cross_up = close > lvl and close[1] <= lvl
+            bool cross_dn = close < lvl and close[1] >= lvl
+
+            // ── BUY: upward cross + all long filters ──
+            if cross_up and confirm_long and not buy_sig
+                buy_sig    := true
+                buy_target := i < 8 ? f_get_lvl(i + 1) : na
+
+            // ── SELL: downward cross + all short filters ──
+            if cross_dn and confirm_short and not sell_sig
+                sell_sig    := true
+                sell_target := i > 0 ? f_get_lvl(i - 1) : na
+
+//  V I S U A L   O U T P U T
+// Signal arrows
+plotshape(buy_sig,  title="Buy Signal",  location=location.belowbar,
+          color=color.lime, style=shape.triangleup,   size=size.normal)
+plotshape(sell_sig, title="Sell Signal", location=location.abovebar,
+          color=color.red,  style=shape.triangledown, size=size.normal)
+
+// Take-profit target labels
+if buy_sig and not na(buy_target)
+    label.new(bar_index, buy_target,
+              "🎯 TP " + str.tostring(buy_target, format.mintick),
+              color     = color.new(color.green, 70),
+              textcolor = color.lime,
+              style     = label.style_label_down,
+              size      = size.small)
+
+if sell_sig and not na(sell_target)
+    label.new(bar_index, sell_target,
+              "🎯 TP " + str.tostring(sell_target, format.mintick),
+              color     = color.new(color.red, 70),
+              textcolor = color.red,
+              style     = label.style_label_up,
+              size      = size.small)
+
+//  A L E R T S
+alertcondition(buy_sig,  title="BUY Signal",
+               message="BUY signal: Level Break with Confirmation — {{ticker}} {{interval}}")
+alertcondition(sell_sig, title="SELL Signal",
+               message="SELL signal: Level Break with Confirmation — {{ticker}} {{interval}}")
+
+//  D E B U G   I N F O   T A B L E   ( enabled via input )
+var table dbg = table.new(position.top_right, 2, 9,
+                          bgcolor      = color.new(color.black, 65),
+                          border_color = color.new(color.gray, 40),
+                          border_width = 1)
+
+if barstate.islast and i_debug
+    // Header row
+    table.cell(dbg, 0, 0, "📊 Debug Info",
+               text_color = color.yellow, text_size = size.small,
+               bgcolor    = color.new(#1A237E, 40))
+    table.cell(dbg, 1, 0, "Value",
+               text_color = color.yellow, text_size = size.small,
+               bgcolor    = color.new(#1A237E, 40))
+
+    // Asia High / Low / Range
+    table.cell(dbg, 0, 1, "Asia High",
+               text_color = color.red, text_size = size.small)
+    table.cell(dbg, 1, 1, str.tostring(lk_hi, format.mintick),
+               text_color = color.red, text_size = size.small)
+
+    table.cell(dbg, 0, 2, "Asia Low",
+               text_color = color.lime, text_size = size.small)
+    table.cell(dbg, 1, 2, str.tostring(lk_lo, format.mintick),
+               text_color = color.lime, text_size = size.small)
+
+    float rng = not na(lk_hi) and not na(lk_lo) ? lk_hi - lk_lo : na
+    table.cell(dbg, 0, 3, "Range",
+               text_color = color.white, text_size = size.small)
+    table.cell(dbg, 1, 3, str.tostring(rng, format.mintick),
+               text_color = color.white, text_size = size.small)
+
+    // RSI
+    color rsi_c = rsi_val > 50 ? color.lime : color.red
+    table.cell(dbg, 0, 4, "RSI(" + str.tostring(i_rsi_len) + ")",
+               text_color = color.white, text_size = size.small)
+    table.cell(dbg, 1, 4, str.tostring(math.round(rsi_val, 2)) +
+               (rsi_val > 50 ? " ▲" : " ▼"),
+               text_color = rsi_c, text_size = size.small)
+
+    // ATR
+    color atr_c = atr_val > atr_thr ? color.lime : color.red
+    table.cell(dbg, 0, 5, "ATR(" + str.tostring(i_atr_len) + ")",
+               text_color = color.white, text_size = size.small)
+    table.cell(dbg, 1, 5, str.tostring(atr_val, format.mintick),
+               text_color = atr_c, text_size = size.small)
+
+    // Volume vs MA
+    float vol_pct = vol_ma > 0 ? math.round(volume / vol_ma * 100) : 0
+    color vol_c   = volume > vol_ma ? color.lime : color.red
+    table.cell(dbg, 0, 6, "Vol / MA%",
+               text_color = color.white, text_size = size.small)
+    table.cell(dbg, 1, 6, str.tostring(vol_pct) + "%",
+               text_color = vol_c, text_size = size.small)
+
+    // Filter summary
+    table.cell(dbg, 0, 7, "Long Filters",
+               text_color = color.white, text_size = size.small)
+    table.cell(dbg, 1, 7, confirm_long  ? "✅ PASS" : "❌ FAIL",
+               text_color = confirm_long  ? color.lime : color.red, text_size = size.small)
+
+    table.cell(dbg, 0, 8, "Short Filters",
+               text_color = color.white, text_size = size.small)
+    table.cell(dbg, 1, 8, confirm_short ? "✅ PASS" : "❌ FAIL",
+               text_color = confirm_short ? color.lime : color.red, text_size = size.small)
+
