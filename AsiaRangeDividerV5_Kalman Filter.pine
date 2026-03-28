@@ -1,0 +1,462 @@
+// ╔══════════════════════════════════════════════════════════════════════════════╗
+// ║   ASIA SESSION RANGE DIVIDER — 8+4 LEVELS  v5                                ║
+// ║   Signal Engine: Kalman Filter + ADX Regime + 5-Factor Quality Score         ║
+// ║   Replaces RSI/ATR/Volume with evidence-weighted probabilistic scoring       ║
+// ╚══════════════════════════════════════════════════════════════════════════════╝
+//
+// ─── RESEARCH RATIONALE ───────────────────────────────────────────────────────
+//
+//  WHY RSI + ATR + VOLUME CAUSE FREQUENT SL HITS:
+//  ① RSI > 50 merely confirms momentum already happened — it lags behind the
+//    cross and cannot distinguish a real breakout from a spike reversal.
+//  ② ATR > threshold only says "the market is moving", not "which direction is
+//    genuine". High ATR during stop-hunt spikes causes false confirmations.
+//  ③ Raw volume > MA simply checks interest, not directional conviction.
+//  Result: all three filters can be satisfied simultaneously on a fakeout candle.
+//
+//  THE KALMAN FILTER SOLUTION:
+//  The Kalman Filter (Rudolf Kálmán, 1960; applied to finance by Ernie Chan et al.)
+//  is a recursive Bayesian estimator — it separates genuine price trend (signal)
+//  from random market noise. Unlike EMA/SMA, it uses an adaptive gain (Kalman
+//  gain K) that automatically weights new data vs. prior state based on
+//  measurement uncertainty. Academic papers (Benhamou 2018, Cazalet & Zheng 2014)
+//  show KF outperforms all moving average variants for trend detection in futures
+//  and forex with less lag and fewer false reversals.
+//
+//  Alpha-Beta KF implemented here (simplified 2-state: position + velocity):
+//    Predict:  x̂⁻ = x̂ + v̂·Δt        (predict next price from velocity)
+//              P⁻  = P + Q              (uncertainty grows with process noise Q)
+//    Update:   K   = P⁻ / (P⁻ + R)    (Kalman gain: how much to trust new price)
+//              x̂  = x̂⁻ + K·(z − x̂⁻)  (blend prediction with measurement)
+//              v̂  = v̂ + α·(z − x̂⁻)   (update velocity/slope estimate)
+//              P  = (1−K)·P⁻           (reduce uncertainty after update)
+//  where Q = process noise (0.01 = smooth), R = measurement noise (1.0 = trust KF)
+//  and α = learning rate for velocity.
+//  The slope of x̂ (kf_velocity) directly indicates trend direction without lag.
+//
+//  5-FACTOR QUALITY SCORE (replaces old 3 toggles):
+//  Each factor is an independent evidence piece, scored 0 or 1. Signal fires
+//  only when composite score ≥ threshold (default 4/5):
+//
+//  Factor 1 — KALMAN DIRECTION  : KF slope agrees with breakout direction
+//  Factor 2 — ADX REGIME        : ADX > 20 → trending market, not choppy range
+//  Factor 3 — CLOSE CONFIRMATION: Candle closed PAST the level (not just spiked)
+//  Factor 4 — BODY QUALITY      : Candle body ≥ 50% of total wick range (no fakeout wicks)
+//  Factor 5 — VOLUME Z-SCORE    : Volume is > 1 std dev above its mean (real surge)
+//
+//  This replaces the "all three must pass" gate (AND logic) with a softer
+//  "at least N of 5 must pass" gate, which is more resilient to one noisy factor.
+//
+// ══════════════════════════════════════════════════════════════════════════════
+
+//@version=6
+indicator("Asia Range Divider [8+4 Levels] v5", overlay=true, max_lines_count=500, max_labels_count=500, max_boxes_count=50)
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  I N P U T S
+// ══════════════════════════════════════════════════════════════════════════════
+var string G_SESS  = "📅 Asia Session"
+string i_sess_time = input.string("0700-1500", "Session Time (GMT+7)",       group=G_SESS)
+bool i_show_lvls   = input.bool(true,  "Show Range Levels",                  group=G_SESS)
+bool i_show_ext    = input.bool(true,  "Show Extension Levels",              group=G_SESS)
+bool i_show_box    = input.bool(true,  "Show Session Box",                   group=G_SESS)
+bool i_show_hist   = input.bool(false, "Show Past Session History",          group=G_SESS)
+
+var string G_KF    = "🔬 Kalman Filter (Noise Reduction)"
+float i_kf_q       = input.float(0.01, "Process Noise Q (lower=smoother)",   group=G_KF, minval=0.0001, maxval=1.0, step=0.001, tooltip="How fast the filter adapts to price changes.\n0.001 = very smooth / slow\n0.1 = fast / reactive")
+float i_kf_r       = input.float(1.0,  "Measurement Noise R (higher=smoother)", group=G_KF, minval=0.1, maxval=10.0, step=0.1, tooltip="How much to trust raw price vs. the KF estimate.\nHigher = smoother KF line, less reactive")
+
+var string G_SCORE = "⚙️ Signal Quality Score (0–5)"
+int  i_min_score   = input.int(4,  "Minimum score to fire signal (0–5)",     group=G_SCORE, minval=0, maxval=5, tooltip="Number of factors (out of 5) that must pass before a signal is generated.\n4 = strict, 3 = moderate, 2 = lenient")
+int  i_adx_len     = input.int(14, "ADX Length",                             group=G_SCORE, minval=1)
+float i_adx_thr    = input.float(20.0, "ADX Trending Threshold",             group=G_SCORE, minval=5.0, step=1.0, tooltip="ADX > this value = trending market (Factor 2).\nDefault 20. Use 25 for stricter trend filter.")
+float i_body_ratio = input.float(0.5, "Min Candle Body Ratio (0–1)",         group=G_SCORE, minval=0.1, maxval=0.99, step=0.05, tooltip="Body must be this fraction of total candle range.\n0.5 = body ≥ 50% of High–Low range.\nFilters out hammer/shooting-star fakeout candles.")
+int  i_vol_len     = input.int(20,  "Volume MA Length",                      group=G_SCORE, minval=2)
+float i_vol_zscore = input.float(1.0, "Volume Z-Score Threshold",            group=G_SCORE, minval=0.1, step=0.1, tooltip="Volume must be this many std-devs above its mean.\n1.0 = 1 standard deviation above average (top ~16% of bars).\nHigher = rarer but stronger volume surges.")
+
+var string G_TRADE = "🎯 Trade Management"
+bool i_lock_trade  = input.bool(true, "Lock: no new signal until TP/SL hit", group=G_TRADE)
+bool i_reset_sess  = input.bool(true, "Reset trade lock on new session",      group=G_TRADE)
+
+var string G_VIS   = "🎨 Visuals"
+bool i_show_score  = input.bool(true,  "Show score label on signal",         group=G_VIS)
+bool i_debug       = input.bool(false, "Debug Mode (Info Table)",            group=G_VIS)
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  S E S S I O N   D E T E C T I O N
+// ══════════════════════════════════════════════════════════════════════════════
+bool in_asia    = not na(time(timeframe.period, i_sess_time, "UTC+7"))
+bool asia_start = in_asia     and not in_asia[1]
+bool asia_end   = not in_asia and     in_asia[1]
+
+var int t_open  = na
+var int t_close = na
+var int t_end   = na   // 03:00 AM GMT+7 = 20:00 UTC = midnight_UTC + 72 000 000 ms
+
+if asia_start
+    t_open := time
+if asia_end
+    t_close := time[1]
+    t_end   := int(t_close / 86400000) * 86400000 + 72000000
+
+int bar_ms = timeframe.in_seconds() * 1000
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  S E S S I O N   H I G H  /  L O W
+// ══════════════════════════════════════════════════════════════════════════════
+var float sess_hi = na
+var float sess_lo = na
+
+if asia_start
+    sess_hi := high
+    sess_lo := low
+else if in_asia
+    sess_hi := math.max(sess_hi, high)
+    sess_lo := math.min(sess_lo, low)
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  L O C K E D   L E V E L S
+// ══════════════════════════════════════════════════════════════════════════════
+var float lk_hi = na, var float lk_lo = na, var float lk_step = na
+var float lv0 = na, var float lv1 = na, var float lv2 = na, var float lv3 = na, var float lv4 = na
+var float lv5 = na, var float lv6 = na, var float lv7 = na, var float lv8 = na
+var float ex_dn1 = na, var float ex_dn2 = na, var float ex_dn3 = na, var float ex_dn4 = na
+var float ex_up1 = na, var float ex_up2 = na, var float ex_up3 = na, var float ex_up4 = na
+
+if asia_end
+    lk_hi   := sess_hi
+    lk_lo   := sess_lo
+    lk_step := (lk_hi - lk_lo) / 8.0
+    float s  = lk_step
+    
+    lv0 := lk_lo, lv1 := lk_lo + s, lv2 := lk_lo + s*2, lv3 := lk_lo + s*3, lv4 := lk_lo + s*4
+    lv5 := lk_lo + s*5, lv6 := lk_lo + s*6, lv7 := lk_lo + s*7, lv8 := lk_hi
+    ex_dn1 := lk_lo - s, ex_dn2 := lk_lo - s*2, ex_dn3 := lk_lo - s*3, ex_dn4 := lk_lo - s*4
+    ex_up1 := lk_hi + s, ex_up2 := lk_hi + s*2, ex_up3 := lk_hi + s*3, ex_up4 := lk_hi + s*4
+
+f_flat_lvl(int fi) =>
+    switch fi
+        0  => ex_dn4
+        1  => ex_dn3
+        2  => ex_dn2
+        3  => ex_dn1
+        4  => lv0
+        5  => lv1
+        6  => lv2
+        7  => lv3
+        8  => lv4
+        9  => lv5
+        10 => lv6
+        11 => lv7
+        12 => lv8
+        13 => ex_up1
+        14 => ex_up2
+        15 => ex_up3
+        16 => ex_up4
+        => float(na)
+
+f_flat_color(int fi) =>
+    fi >= 13 ? color.new(#880000, 0) : fi >= 10 ? color.new(#FF4444, 0) :
+      fi >= 7  ? color.new(#AAAAAA, 40): fi >= 4  ? color.new(#00CC66, 0) :
+      color.new(#004400, 0)
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  K A L M A N   F I L T E R   (Alpha-Beta, 2-state: position + velocity)
+// ══════════════════════════════════════════════════════════════════════════════
+var float kf_price = close      // state: filtered price estimate
+var float kf_vel   = 0.0        // state: velocity (slope of filtered price)
+var float kf_p     = 1.0        // error covariance
+
+// Predict
+float kf_p_pred = kf_p + i_kf_q
+float kf_x_pred = kf_price + kf_vel
+
+// Kalman gain
+float kf_k = kf_p_pred / (kf_p_pred + i_kf_r)
+
+// Innovation (distance between raw price and prediction)
+float kf_innov = close - kf_x_pred
+
+// Update state
+kf_price := kf_x_pred + kf_k * kf_innov
+kf_vel   := kf_vel    + kf_k * kf_innov   // velocity = adaptive slope
+kf_p     := (1.0 - kf_k) * kf_p_pred
+
+// Slope direction
+bool kf_up   = kf_vel > 0 and kf_vel >= kf_vel[1]   
+bool kf_down = kf_vel < 0 and kf_vel <= kf_vel[1]   
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  A D X   —   Market Regime Filter
+// ══════════════════════════════════════════════════════════════════════════════
+[adx_dip, adx_dim, adx_val] = ta.dmi(i_adx_len, i_adx_len)
+bool adx_trend = adx_val > i_adx_thr
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  V O L U M E   Z-SCORE
+// ══════════════════════════════════════════════════════════════════════════════
+float vol_mean   = ta.sma(volume, i_vol_len)
+float vol_std    = ta.stdev(volume, i_vol_len)
+float vol_z      = vol_std > 0 ? (volume - vol_mean) / vol_std : 0.0
+bool  vol_surge  = vol_z >= i_vol_zscore
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  5-FACTOR QUALITY SCORE (Factor 4)
+// ══════════════════════════════════════════════════════════════════════════════
+float candle_range = high - low
+float candle_body  = math.abs(close - open)
+bool  body_ok      = candle_range > 0 and (candle_body / candle_range) >= i_body_ratio
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  S E S S I O N   B O X
+// ══════════════════════════════════════════════════════════════════════════════
+var box asia_box = na
+if i_show_box
+    if asia_start
+        box.delete(asia_box)
+        asia_box := box.new(left=t_open, top=sess_hi, right=time+bar_ms, bottom=sess_lo,
+          xloc=xloc.bar_time, border_color=color.new(#FF9800,30),
+          bgcolor=color.new(#FF9800,88), border_width=1)
+    if in_asia and not na(asia_box)
+        box.set_right(asia_box, time+bar_ms)
+        box.set_top(asia_box, sess_hi)
+        box.set_bottom(asia_box, sess_lo)
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  D R A W   L E V E L   L I N E S   &   L A B E L S
+// ══════════════════════════════════════════════════════════════════════════════
+var line[]  all_lines    = array.new_line()
+var label[] all_labels   = array.new_label()
+var label[] float_labels = array.new_label()
+
+if asia_end
+    if not i_show_hist
+        for ln in all_lines
+            line.delete(ln)
+        array.clear(all_lines)
+        
+        for lb in all_labels
+            label.delete(lb)
+        array.clear(all_labels)
+        
+    array.clear(float_labels)
+
+    for fi = 0 to 16
+        bool is_range = fi >= 4 and fi <= 12
+        bool is_ext   = not is_range
+        if (is_range and not i_show_lvls) or (is_ext and not i_show_ext)
+            continue
+            
+        float lvl    = f_flat_lvl(fi)
+        color c      = f_flat_color(fi)
+        bool  is_key = (fi==0 or fi==4 or fi==12 or fi==16)
+        string tag =
+             fi==16 ? "EXT+4 ▲▲ Strong Supply" : fi==15 ? "EXT+3 ▲ Supply Ext"  :
+             fi==14 ? "EXT+2 ▲ Supply Ext"     : fi==13 ? "EXT+1 ▲ Supply Ext"  :
+             fi==12 ? "L8 — Asia High ▲ Supply" : fi== 4 ? "L0 — Asia Low ▼ Demand" :
+             fi== 3 ? "EXT-1 ▼ Demand Ext"      : fi== 2 ? "EXT-2 ▼ Demand Ext"  :
+             fi== 1 ? "EXT-3 ▼ Demand Ext"      : fi== 0 ? "EXT-4 ▼▼ Strong Demand":
+             fi>=10 ? "L"+str.tostring(fi-4)+" ▲ Supply" :
+             fi>= 7 ? "L"+str.tostring(fi-4)+" ● Mid"    :
+             "L"+str.tostring(fi-4)+" ▼ Demand"
+
+        line ln = line.new(x1=t_close, y1=lvl, x2=t_end, y2=lvl,
+          xloc=xloc.bar_time, color=c,
+          width=is_key?2:1,
+          style=is_ext?line.style_dotted:is_key?line.style_solid:line.style_dashed)
+        array.push(all_lines, ln)
+
+        label lb = label.new(x=t_close, y=lvl, text=tag, xloc=xloc.bar_time,
+          color=color.new(c,80), textcolor=c,
+          style=label.style_label_left, size=size.small)
+        array.push(all_labels, lb)
+        array.push(float_labels, lb)
+
+if array.size(float_labels) > 0 and barstate.islast
+    int fx = not na(t_end) ? math.min(time, t_end) : time
+    for lb in float_labels
+        label.set_x(lb, fx)
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  T R A D E   S T A T E
+// ══════════════════════════════════════════════════════════════════════════════
+var bool  in_trade   = false
+var bool  trade_long = false
+var float trade_tp   = na
+var float trade_sl   = na
+var line  tp_ln      = na
+var line  sl_ln      = na
+
+if asia_start and i_reset_sess
+    in_trade := false
+
+bool tp_hit = false
+bool sl_hit = false
+
+if in_trade
+    tp_hit := trade_long ? high >= trade_tp : low  <= trade_tp
+    sl_hit := trade_long ? low  <= trade_sl : high >= trade_sl
+    
+    if tp_hit or sl_hit
+        in_trade := false
+        
+        if not na(tp_ln)
+            line.set_x2(tp_ln, time)
+            
+        if not na(sl_ln)
+            line.set_x2(sl_ln, time)
+            
+        float exit_p = tp_hit ? trade_tp : trade_sl
+        
+        label.new(x=time, y=exit_p,
+          text=(tp_hit ? "✅ TP HIT\n" : "❌ SL HIT\n") + str.tostring(exit_p, format.mintick),
+          xloc=xloc.bar_time,
+          color=tp_hit ? color.new(#00AA44, 55) : color.new(#CC0000, 55),
+          textcolor=tp_hit ? color.lime : color.red,
+          style=tp_hit ? label.style_label_upper_left : label.style_label_lower_left,
+          size=size.small)
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  S I G N A L   L O G I C   —   5-Factor Quality Score
+// ══════════════════════════════════════════════════════════════════════════════
+bool post_session = not in_asia and not na(lk_hi)
+bool can_enter    = not i_lock_trade or not in_trade
+
+bool  buy_sig  = false
+bool  sell_sig = false
+float sig_tp   = na
+float sig_sl   = na
+int   sig_fi   = -1
+int   sig_score= 0
+
+if post_session and can_enter
+    // ── BUY scan (bottom → top: first level broken upward) ───────────────────
+    for fi = 0 to 16
+        float lvl = f_flat_lvl(fi)
+        if not na(lvl)
+            bool crossed_up = close > lvl and close[1] <= lvl
+            if crossed_up
+                bool f1 = kf_up
+                bool f2 = adx_trend
+                bool f3 = open < lvl
+                bool f4 = body_ok
+                bool f5 = vol_surge
+
+                int score = (f1?1:0)+(f2?1:0)+(f3?1:0)+(f4?1:0)+(f5?1:0)
+
+                if score >= i_min_score
+                    float tp_c = fi < 16 ? f_flat_lvl(fi+1) : float(na)
+                    float sl_c = fi >  0 ? f_flat_lvl(fi-1) : float(na)
+                    if not na(tp_c) and not na(sl_c)
+                        buy_sig   := true
+                        sig_tp    := tp_c
+                        sig_sl    := sl_c
+                        sig_fi    := fi
+                        sig_score := score
+                        break
+
+    // ── SELL scan (top → bottom: first level broken downward) ────────────────
+    if not buy_sig
+        for fi = 16 to 0 
+            float lvl = f_flat_lvl(fi)
+            if not na(lvl)
+                bool crossed_dn = close < lvl and close[1] >= lvl
+                if crossed_dn
+                    bool f1 = kf_down
+                    bool f2 = adx_trend
+                    bool f3 = open > lvl
+                    bool f4 = body_ok
+                    bool f5 = vol_surge
+
+                    int score = (f1?1:0)+(f2?1:0)+(f3?1:0)+(f4?1:0)+(f5?1:0)
+
+                    if score >= i_min_score
+                        float tp_c = fi >  0 ? f_flat_lvl(fi-1) : float(na)
+                        float sl_c = fi < 16 ? f_flat_lvl(fi+1) : float(na)
+                        if not na(tp_c) and not na(sl_c)
+                            sell_sig  := true
+                            sig_tp    := tp_c
+                            sig_sl    := sl_c
+                            sig_fi    := fi
+                            sig_score := score
+                            break
+
+// ── Activate trade, draw TP/SL lines & signal label ─────────────────────────
+if buy_sig or sell_sig
+    in_trade   := true
+    trade_long := buy_sig
+    trade_tp   := sig_tp
+    trade_sl   := sig_sl
+    
+    line.delete(tp_ln)
+    line.delete(sl_ln)
+    
+    int le = not na(t_end) ? t_end : time + bar_ms * 300
+
+    tp_ln := line.new(x1=time, y1=sig_tp, x2=le, y2=sig_tp, xloc=xloc.bar_time,
+      color=color.new(color.lime,35), style=line.style_dashed, width=1)
+    sl_ln := line.new(x1=time, y1=sig_sl, x2=le, y2=sig_sl, xloc=xloc.bar_time,
+      color=color.new(color.red,35),  style=line.style_dashed, width=1)
+
+    if i_show_score
+        string score_bar  = sig_score >= 5 ? "●●●●●" : sig_score==4 ? "●●●●○" :
+                             sig_score==3 ? "●●●○○" : sig_score==2 ? "●●○○○" : "●○○○○"
+        string score_pct  = str.tostring(math.round(sig_score/5.0*100)) + "%"
+        float  step_size  = math.abs(sig_tp - f_flat_lvl(sig_fi))
+        
+        label.new(x = time, y = buy_sig ? low : high,
+          text      = (buy_sig ? "🟢 BUY" : "🔴 SELL") +
+                      "\nTP → " + str.tostring(sig_tp, format.mintick) +
+                      "\nSL → " + str.tostring(sig_sl, format.mintick) +
+                      "\nRR 1:1 | " + str.tostring(step_size, format.mintick) +
+                      "\nQuality: " + score_bar + " " + score_pct,
+          xloc      = xloc.bar_time,
+          color     = buy_sig ? color.new(#003300,55) : color.new(#330000,55),
+          textcolor = buy_sig ? color.lime : color.red,
+          style     = buy_sig ? label.style_label_upper_right : label.style_label_lower_right,
+          size      = size.small)
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  P L O T S
+// ══════════════════════════════════════════════════════════════════════════════
+plot(kf_price, "Kalman Filter", color=kf_vel>0?color.new(#00AAFF,60):color.new(#FF6600,60), linewidth=1, style=plot.style_line)
+
+plotshape(buy_sig,  title="Buy",  location=location.belowbar, color=color.lime, style=shape.triangleup,   size=size.normal)
+plotshape(sell_sig, title="Sell", location=location.abovebar, color=color.red,  style=shape.triangledown, size=size.normal)
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  A L E R T S
+// ══════════════════════════════════════════════════════════════════════════════
+alertcondition(buy_sig,  title="BUY",    message="BUY — Kalman+Score confirmed — {{ticker}} {{interval}}")
+alertcondition(sell_sig, title="SELL",   message="SELL — Kalman+Score confirmed — {{ticker}} {{interval}}")
+alertcondition(tp_hit,   title="TP Hit",  message="✅ TP Hit — {{ticker}} {{interval}}")
+alertcondition(sl_hit,   title="SL Hit",  message="❌ SL Hit — {{ticker}} {{interval}}")
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  D E B U G   T A B L E
+// ══════════════════════════════════════════════════════════════════════════════
+var table dbg = table.new(position.top_right, 2, 14, bgcolor=color.new(color.black,65), border_color=color.new(color.gray,40), border_width=1)
+
+// Define the function in global scope
+f_row(int r, string k, string v, color vc) =>
+    table.cell(dbg,0,r,k,text_color=color.white,text_size=size.small)
+    table.cell(dbg,1,r,v,text_color=vc,          text_size=size.small)
+
+if barstate.islast and i_debug
+    table.cell(dbg,0,0,"📊 Factor State",text_color=color.yellow,text_size=size.small,bgcolor=color.new(#1A237E,40))
+    table.cell(dbg,1,0,"Value",           text_color=color.yellow,text_size=size.small,bgcolor=color.new(#1A237E,40))
+
+    f_row(1, "KF Price",    str.tostring(kf_price,  format.mintick), color.white)
+    f_row(2, "KF Velocity", str.tostring(math.round(kf_vel,6)), kf_vel>0?color.lime:color.red)
+    f_row(3, "KF Up",       kf_up  ?"✅":"❌", kf_up  ?color.lime:color.red)
+    f_row(4, "KF Down",     kf_down?"✅":"❌", kf_down?color.lime:color.red)
+    f_row(5, "ADX",         str.tostring(math.round(adx_val,1)), adx_trend?color.lime:color.orange)
+    f_row(6, "ADX Trending",adx_trend?"✅ YES":"❌ NO", adx_trend?color.lime:color.red)
+    f_row(7, "Vol Z-Score", str.tostring(math.round(vol_z,2)), vol_surge?color.lime:color.gray)
+    f_row(8, "Vol Surge",   vol_surge?"✅":"❌", vol_surge?color.lime:color.red)
+    f_row(9, "Body Ratio",  str.tostring(math.round(candle_range>0?candle_body/candle_range:0,2)), body_ok?color.lime:color.gray)
+    f_row(10,"Body OK",     body_ok?"✅":"❌", body_ok?color.lime:color.red)
+    f_row(11,"Asia Hi",     str.tostring(lk_hi,format.mintick), color.red)
+    f_row(12,"Asia Lo",     str.tostring(lk_lo,format.mintick), color.lime)
+    f_row(13,"In Trade",    in_trade?(trade_long?"🟢 LONG":"🔴 SHORT"):"—",
+          in_trade?(trade_long?color.lime:color.red):color.gray)
