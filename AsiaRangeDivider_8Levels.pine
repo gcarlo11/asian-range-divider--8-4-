@@ -1,48 +1,46 @@
 //@version=6
-indicator("Asia Range Divider [8 Levels]", overlay=true,
-          max_lines_count=500, max_labels_count=400, max_boxes_count=20)
+indicator("Asia Range Divider [8+4 Levels]", overlay=true,
+          max_lines_count=500, max_labels_count=500, max_boxes_count=20)
 
 //  I N P U T S
 var string G_SESS = "📅 Asia Session"
-i_sess_time = input.string("0700-1500", "Session Time (GMT+7)",
-              group=G_SESS, tooltip="Format: HHMM-HHMM  |  Default = 07:00–15:00 GMT+7")
-i_show_lvls = input.bool(true, "Show Levels",      group=G_SESS)
-i_show_box  = input.bool(true, "Show Session Box", group=G_SESS)
+i_sess_time  = input.string("0700-1500", "Session Time (GMT+7)",
+               group=G_SESS, tooltip="Format: HHMM-HHMM  |  Default = 07:00–15:00 GMT+7")
+i_show_lvls  = input.bool(true,  "Show Range Levels",      group=G_SESS)
+i_show_ext   = input.bool(true,  "Show Extension Levels",  group=G_SESS)
+i_show_box   = input.bool(true,  "Show Session Box",       group=G_SESS)
 
 var string G_FILT = "⚙️ Confirmation Filters"
-i_use_vol  = input.bool(true,  "Volume Filter",              group=G_FILT)
-i_vol_len  = input.int(20,     "Volume MA Length",            group=G_FILT, minval=1)
-i_use_atr  = input.bool(true,  "ATR Filter",                 group=G_FILT)
-i_atr_len  = input.int(14,     "ATR Length",                 group=G_FILT, minval=1)
-i_atr_thr  = input.float(0.0,  "ATR Min Threshold (0=auto)", group=G_FILT, minval=0,
-              step=0.00001, tooltip="0 = half of 50-bar ATR SMA (auto-adaptive)")
-i_use_rsi  = input.bool(true, "RSI Filter",  group=G_FILT)
-i_rsi_len  = input.int(14,    "RSI Length",  group=G_FILT, minval=1)
+i_use_vol    = input.bool(true,  "Volume Filter",              group=G_FILT)
+i_vol_len    = input.int(20,     "Volume MA Length",            group=G_FILT, minval=1)
+i_use_atr    = input.bool(true,  "ATR Filter",                 group=G_FILT)
+i_atr_len    = input.int(14,     "ATR Length",                 group=G_FILT, minval=1)
+i_atr_thr    = input.float(0.0,  "ATR Min Threshold (0=auto)", group=G_FILT, minval=0,
+               step=0.00001, tooltip="0 = half of 50-bar ATR SMA (auto-adaptive)")
+i_use_rsi    = input.bool(true,  "RSI Filter",  group=G_FILT)
+i_rsi_len    = input.int(14,     "RSI Length",  group=G_FILT, minval=1)
 
 var string G_VIS = "🎨 Visuals"
-i_debug    = input.bool(false, "Debug Mode (Info Table)", group=G_VIS)
+i_debug      = input.bool(false, "Debug Mode (Info Table)", group=G_VIS)
 
 //  S E S S I O N   D E T E C T I O N   (UTC+7)
 bool in_asia    = not na(time(timeframe.period, i_sess_time, "UTC+7"))
-bool asia_start = in_asia     and not in_asia[1]   // rising edge
-bool asia_end   = not in_asia and     in_asia[1]   // falling edge
+bool asia_start = in_asia     and not in_asia[1]
+bool asia_end   = not in_asia and     in_asia[1]
 
-// ── Store UNIX-millisecond timestamps for every drawing ───────────────────────
-// These are wall-clock anchors — unaffected by bar_index, zoom, or TF.
-var int t_open  = na     // time of the first bar inside the session
-var int t_close = na     // time of the last  bar inside the session
+// Wall-clock timestamps (Unix ms) — never changes on zoom, scroll, or TF switch
+var int t_open  = na   // first bar of session
+var int t_close = na   // last  bar of session
 
 if asia_start
     t_open := time
-
-// asia_end fires on the FIRST bar after the session; time[1] = last session bar
 if asia_end
-    t_close := time[1]
+    t_close := time[1]   // time[1] = the bar that just closed the session
 
-// ── One bar width in ms (used to size the box right-edge flush to bar) ────────
+// One bar width in ms — used only for box sizing
 int bar_ms = timeframe.in_seconds() * 1000
 
-//  S E S S I O N   H I G H  /  L O W   (live)
+//  S E S S I O N   H I G H  /  L O W
 var float sess_hi = na
 var float sess_lo = na
 
@@ -53,10 +51,16 @@ else if in_asia
     sess_hi := math.max(sess_hi, high)
     sess_lo := math.min(sess_lo, low)
 
-//  L O C K E D   L E V E L S   (9 prices, set once when session closes)
-var float lk_hi = na
-var float lk_lo = na
+//  L O C K E D   L E V E L S   (set once at asia_end, never change after)
+//
+//  Layout (low → high):
+//    EX_DN4  EX_DN3  EX_DN2  EX_DN1  |  L0–L8  |  EX_UP1  EX_UP2  EX_UP3  EX_UP4
+//    ← 4 extension below ──────────────────────────── 4 extension above →
+var float lk_hi   = na
+var float lk_lo   = na
+var float lk_step = na   // one eighth of the range — same step used for extensions
 
+// Range levels L0–L8
 var float lv0 = na
 var float lv1 = na
 var float lv2 = na
@@ -67,47 +71,94 @@ var float lv6 = na
 var float lv7 = na
 var float lv8 = na
 
+// Extension levels — BELOW range (dn1 = just below L0, dn4 = furthest below)
+var float ex_dn1 = na
+var float ex_dn2 = na
+var float ex_dn3 = na
+var float ex_dn4 = na
+
+// Extension levels — ABOVE range (up1 = just above L8, up4 = furthest above)
+var float ex_up1 = na
+var float ex_up2 = na
+var float ex_up3 = na
+var float ex_up4 = na
+
 if asia_end
-    lk_hi := sess_hi
-    lk_lo := sess_lo
-    float step = (lk_hi - lk_lo) / 8.0
+    lk_hi   := sess_hi
+    lk_lo   := sess_lo
+    lk_step := (lk_hi - lk_lo) / 8.0
+    float s  = lk_step
+
+    // Core range
     lv0 := lk_lo
-    lv1 := lk_lo + step
-    lv2 := lk_lo + step * 2
-    lv3 := lk_lo + step * 3
-    lv4 := lk_lo + step * 4
-    lv5 := lk_lo + step * 5
-    lv6 := lk_lo + step * 6
-    lv7 := lk_lo + step * 7
+    lv1 := lk_lo + s
+    lv2 := lk_lo + s * 2
+    lv3 := lk_lo + s * 3
+    lv4 := lk_lo + s * 4
+    lv5 := lk_lo + s * 5
+    lv6 := lk_lo + s * 6
+    lv7 := lk_lo + s * 7
     lv8 := lk_hi
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
-f_get_lvl(int idx) =>
-    switch idx
-        0 => lv0
-        1 => lv1
-        2 => lv2
-        3 => lv3
-        4 => lv4
-        5 => lv5
-        6 => lv6
-        7 => lv7
-        8 => lv8
+    // Extensions below
+    ex_dn1 := lk_lo - s
+    ex_dn2 := lk_lo - s * 2
+    ex_dn3 := lk_lo - s * 3
+    ex_dn4 := lk_lo - s * 4
+
+    // Extensions above
+    ex_up1 := lk_hi + s
+    ex_up2 := lk_hi + s * 2
+    ex_up3 := lk_hi + s * 3
+    ex_up4 := lk_hi + s * 4
+
+//  H E L P E R S
+// Index convention for signal loop:
+//   0-8   = L0–L8 (range)
+//   9-12  = EX_UP1–EX_UP4
+//  -4 to -1 = EX_DN4–EX_DN1  (handled as 13-16 internally below)
+
+// Unified level getter (0–16 flat index: 0=EX_DN4 … 4=L0 … 12=L8 … 16=EX_UP4)
+f_flat_lvl(int fi) =>
+    switch fi
+        0  => ex_dn4
+        1  => ex_dn3
+        2  => ex_dn2
+        3  => ex_dn1
+        4  => lv0
+        5  => lv1
+        6  => lv2
+        7  => lv3
+        8  => lv4
+        9  => lv5
+        10 => lv6
+        11 => lv7
+        12 => lv8
+        13 => ex_up1
+        14 => ex_up2
+        15 => ex_up3
+        16 => ex_up4
         => float(na)
 
-f_lvl_color(int idx) =>
-    idx >= 6 ? color.new(#FF4444, 0) :
-     idx <= 2 ? color.new(#00CC66, 0) :
-     color.new(#AAAAAA, 40)
+// ── Color scheme ──────────────────────────────────────────────────────────────
+//  Extensions above → dark maroon       (heavy supply)
+//  Range top  L6–L8 → red              (supply)
+//  Range mid  L3–L5 → neutral gray
+//  Range bot  L0–L2 → green            (demand)
+//  Extensions below → dark forest green (heavy demand)
+f_flat_color(int fi) =>
+    fi >= 13  ? color.new(#880000, 0) :   // ext above  — dark maroon
+     fi >= 10  ? color.new(#FF4444, 0) :   // L6–L8      — red
+     fi >= 7   ? color.new(#AAAAAA, 40) :  // L3–L5      — neutral
+     fi >= 4   ? color.new(#00CC66, 0) :   // L0–L2      — green
+     color.new(#004400, 0)                 // ext below  — dark green
 
-//  S E S S I O N   B O X   — anchored to t_open / t_close (bar_time)
-// KEY: xloc.bar_time means left/right are Unix ms → immune to bar_index shifts
+//  S E S S I O N   B O X
 var box asia_box = na
 
 if i_show_box
     if asia_start
         box.delete(asia_box)
-        // right = time + bar_ms so the box covers the full width of the first bar
         asia_box := box.new(
              left         = t_open,
              top          = sess_hi,
@@ -119,43 +170,67 @@ if i_show_box
              border_width = 1)
 
     if in_asia and not na(asia_box)
-        // Stretch the box rightward to the current bar's right edge
         box.set_right(asia_box, time + bar_ms)
         box.set_top(asia_box, sess_hi)
         box.set_bottom(asia_box, sess_lo)
 
-//  D R A W   L E V E L   L I N E S   &   L A B E L S
-//  • Lines: xloc.bar_time + extend.right → pinned to session-close wall time,
-//           extend infinitely rightward. Never shifts on zoom / TF change.
-//  • Labels: created with xloc.bar_time, then x is updated to current bar's
-//            time every bar so they always float at the chart's right edge.
-var line[]  lvl_lines  = array.new_line()
-var label[] lvl_labels = array.new_label()
+//  D R A W   L I N E S   &   L A B E L S
+//
+//  WHY THIS IS ZOOM/TF-STABLE:
+//  ① Lines    → xloc.bar_time + extend.right
+//               x1 = t_close (Unix ms, never changes) → line origin is fixed
+//               extend.right paints to the right of that fixed origin
+//  ② Labels   → xloc.bar_time created at t_close
+//               x updated ONLY on barstate.islast → always = latest bar's time
+//               barstate.islast guard prevents stale x values on historical bars
+var line[]  all_lines  = array.new_line()
+var label[] all_labels = array.new_label()
 
-if asia_end and i_show_lvls
-    // Purge previous session drawings
-    for ln in lvl_lines
+if asia_end
+    // ── Purge all previous session drawings ──────────────────────────────────
+    for ln in all_lines
         line.delete(ln)
-    array.clear(lvl_lines)
-
-    for lb in lvl_labels
+    array.clear(all_lines)
+    for lb in all_labels
         label.delete(lb)
-    array.clear(lvl_labels)
+    array.clear(all_labels)
 
-    // t_close = last bar of session; draw from there, extend right forever
-    for i = 0 to 8
-        float  lvl         = f_get_lvl(i)
-        color  c           = f_lvl_color(i)
-        bool   is_boundary = (i == 0 or i == 8)
+    // ── Draw all 17 levels (flat index 0–16) ─────────────────────────────────
+    for fi = 0 to 16
+        bool  is_range = (fi >= 4 and fi <= 12)
+        bool  is_ext   = not is_range
 
-        string zone_tag = i >= 6 ? " ▲ Supply" : i <= 2 ? " ▼ Demand" : " ● Mid"
-        string lbl_text = i == 0 ? "L0 — Asia Low"  + zone_tag :
-                           i == 8 ? "L8 — Asia High" + zone_tag :
-                           "L" + str.tostring(i) + zone_tag
+        // Skip if the respective toggle is off
+        if (is_range and not i_show_lvls) or (is_ext and not i_show_ext)
+            continue
 
-        // ── Horizontal level line ─────────────────────────────────────────────
-        // x1/x2 are Unix-ms timestamps (xloc.bar_time).
-        // extend.right makes the line stretch to the right edge of ANY zoom level.
+        float lvl = f_flat_lvl(fi)
+        color c   = f_flat_color(fi)
+
+        // Boundary lines (L0, L8, EX_DN4, EX_UP4) are solid & slightly thicker
+        bool  is_key   = (fi == 0 or fi == 4 or fi == 12 or fi == 16)
+        int   lw       = is_key ? 2 : 1
+        string ls      = is_ext ? line.style_dotted :
+                          is_key ? line.style_solid  :
+                          line.style_dashed
+
+        // ── Human-readable label text ─────────────────────────────────────────
+        string tag =
+             fi == 16 ? "EXT+4 ▲▲ Strong Supply" :
+             fi == 15 ? "EXT+3 ▲ Supply Ext"     :
+             fi == 14 ? "EXT+2 ▲ Supply Ext"     :
+             fi == 13 ? "EXT+1 ▲ Supply Ext"     :
+             fi == 12 ? "L8 — Asia High ▲ Supply":
+             fi == 4  ? "L0 — Asia Low ▼ Demand" :
+             fi == 3  ? "EXT-1 ▼ Demand Ext"     :
+             fi == 2  ? "EXT-2 ▼ Demand Ext"     :
+             fi == 1  ? "EXT-3 ▼ Demand Ext"     :
+             fi == 0  ? "EXT-4 ▼▼ Strong Demand" :
+             fi >= 10 ? "L" + str.tostring(fi-4) + " ▲ Supply"  :
+             fi >= 7  ? "L" + str.tostring(fi-4) + " ● Mid"     :
+             "L" + str.tostring(fi-4) + " ▼ Demand"
+
+        // ── Line (origin = t_close, extends right forever) ───────────────────
         line ln = line.new(
              x1     = t_close,
              y1     = lvl,
@@ -163,29 +238,36 @@ if asia_end and i_show_lvls
              y2     = lvl,
              xloc   = xloc.bar_time,
              color  = c,
-             width  = is_boundary ? 2 : 1,
-             style  = is_boundary ? line.style_solid : line.style_dashed,
+             width  = lw,
+             style  = ls,
              extend = extend.right)
-        array.push(lvl_lines, ln)
+        array.push(all_lines, ln)
 
-        // ── Label — xloc.bar_time; x is floated to right edge every bar ───────
+        // ── Label (created at t_close; x floated on barstate.islast below) ───
         label lb = label.new(
              x         = t_close,
              y         = lvl,
-             text      = lbl_text,
+             text      = tag,
              xloc      = xloc.bar_time,
-             color     = color.new(c, 75),
+             color     = color.new(c, 80),
              textcolor = c,
              style     = label.style_label_left,
              size      = size.small)
-        array.push(lvl_labels, lb)
+        array.push(all_labels, lb)
 
-// ── Float labels to the live right edge of the chart ─────────────────────────
-// label.set_x() with xloc.bar_time accepts a Unix-ms value.
-// Setting x = time on every bar means the label is always at the newest candle.
-// This is zoom-proof because it uses wall-clock time, not bar_index.
-if i_show_lvls and array.size(lvl_labels) > 0
-    for lb in lvl_labels
+// ── Float label x to the live right edge — ONLY on the last bar ──────────────
+//
+//  CRITICAL FIX vs previous version:
+//  Running label.set_x on EVERY bar means historical bars set x to a past
+//  timestamp. Pine executes bars in order, so the *last* execution wins —
+//  but this causes jitter during replay and costs CPU on every tick.
+//
+//  With barstate.islast the update fires exactly ONCE per script execution,
+//  always on bar N (the newest bar), so x = time = the most recent timestamp.
+//  This is the correct, stable, and efficient pattern for floating labels.
+//
+if array.size(all_labels) > 0 and barstate.islast
+    for lb in all_labels
         label.set_x(lb, time)
 
 //  I N D I C A T O R   C A L C U L A T I O N S
@@ -200,11 +282,10 @@ bool vol_ok    = not i_use_vol or (volume > vol_ma)
 bool atr_ok    = not i_use_atr or (atr_val > atr_thr)
 bool rsi_long  = not i_use_rsi or (rsi_val > 50)
 bool rsi_short = not i_use_rsi or (rsi_val < 50)
-
 bool confirm_long  = vol_ok and atr_ok and rsi_long
 bool confirm_short = vol_ok and atr_ok and rsi_short
 
-//  S I G N A L   L O G I C   (post-session only)
+//  S I G N A L   L O G I C   — covers all 17 levels (post-session only)
 bool  post_session = not in_asia and not na(lk_hi)
 
 bool  buy_sig     = false
@@ -213,19 +294,19 @@ float buy_target  = na
 float sell_target = na
 
 if post_session
-    for i = 0 to 8
-        float lvl = f_get_lvl(i)
+    for fi = 0 to 16
+        float lvl = f_flat_lvl(fi)
         if not na(lvl)
             bool cross_up = close > lvl and close[1] <= lvl
             bool cross_dn = close < lvl and close[1] >= lvl
 
             if cross_up and confirm_long and not buy_sig
                 buy_sig    := true
-                buy_target := i < 8 ? f_get_lvl(i + 1) : na
+                buy_target := fi < 16 ? f_flat_lvl(fi + 1) : na
 
             if cross_dn and confirm_short and not sell_sig
                 sell_sig    := true
-                sell_target := i > 0 ? f_get_lvl(i - 1) : na
+                sell_target := fi > 0  ? f_flat_lvl(fi - 1) : na
 
 //  V I S U A L   O U T P U T
 plotshape(buy_sig,  title="Buy Signal",  location=location.belowbar,
@@ -233,30 +314,24 @@ plotshape(buy_sig,  title="Buy Signal",  location=location.belowbar,
 plotshape(sell_sig, title="Sell Signal", location=location.abovebar,
           color=color.red,  style=shape.triangledown, size=size.normal)
 
-// ── TP labels pinned to the SIGNAL BAR's wall time ───────────────────────────
-// xloc.bar_time + x=time → permanently anchored to that candle's timestamp,
-// immune to future zooming, scrolling, or timeframe changes.
+// TP labels — anchored to signal bar's wall-clock time (xloc.bar_time)
 if buy_sig and not na(buy_target)
-    label.new(
-         x         = time,
-         y         = buy_target,
-         text      = "🎯 TP " + str.tostring(buy_target, format.mintick),
-         xloc      = xloc.bar_time,
-         color     = color.new(color.green, 70),
-         textcolor = color.lime,
-         style     = label.style_label_down,
-         size      = size.small)
+    label.new(x=time, y=buy_target,
+              text      = "🎯 TP " + str.tostring(buy_target, format.mintick),
+              xloc      = xloc.bar_time,
+              color     = color.new(color.green, 70),
+              textcolor = color.lime,
+              style     = label.style_label_down,
+              size      = size.small)
 
 if sell_sig and not na(sell_target)
-    label.new(
-         x         = time,
-         y         = sell_target,
-         text      = "🎯 TP " + str.tostring(sell_target, format.mintick),
-         xloc      = xloc.bar_time,
-         color     = color.new(color.red, 70),
-         textcolor = color.red,
-         style     = label.style_label_up,
-         size      = size.small)
+    label.new(x=time, y=sell_target,
+              text      = "🎯 TP " + str.tostring(sell_target, format.mintick),
+              xloc      = xloc.bar_time,
+              color     = color.new(color.red, 70),
+              textcolor = color.red,
+              style     = label.style_label_up,
+              size      = size.small)
 
 //  A L E R T S
 alertcondition(buy_sig,  title="BUY Signal",
@@ -265,9 +340,9 @@ alertcondition(sell_sig, title="SELL Signal",
                message="SELL signal: Level Break with Confirmation — {{ticker}} {{interval}}")
 
 //  D E B U G   T A B L E
-var table dbg = table.new(position.top_right, 2, 9,
+var table dbg = table.new(position.top_right, 2, 10,
                           bgcolor      = color.new(color.black, 65),
-                          border_color = color.new(color.gray, 40),
+                          border_color = color.new(color.gray,  40),
                           border_width = 1)
 
 if barstate.islast and i_debug
@@ -276,36 +351,35 @@ if barstate.islast and i_debug
     table.cell(dbg, 1, 0, "Value",
                text_color=color.yellow, text_size=size.small, bgcolor=color.new(#1A237E,40))
 
-    table.cell(dbg, 0, 1, "Asia High", text_color=color.red,  text_size=size.small)
-    table.cell(dbg, 1, 1, str.tostring(lk_hi, format.mintick), text_color=color.red,  text_size=size.small)
-
-    table.cell(dbg, 0, 2, "Asia Low",  text_color=color.lime, text_size=size.small)
-    table.cell(dbg, 1, 2, str.tostring(lk_lo, format.mintick), text_color=color.lime, text_size=size.small)
-
+    table.cell(dbg, 0, 1, "Asia High",  text_color=color.red,   text_size=size.small)
+    table.cell(dbg, 1, 1, str.tostring(lk_hi,   format.mintick), text_color=color.red,   text_size=size.small)
+    table.cell(dbg, 0, 2, "Asia Low",   text_color=color.lime,  text_size=size.small)
+    table.cell(dbg, 1, 2, str.tostring(lk_lo,   format.mintick), text_color=color.lime,  text_size=size.small)
+    table.cell(dbg, 0, 3, "Step Size",  text_color=color.white, text_size=size.small)
+    table.cell(dbg, 1, 3, str.tostring(lk_step, format.mintick), text_color=color.white, text_size=size.small)
+    table.cell(dbg, 0, 4, "Range",      text_color=color.white, text_size=size.small)
     float rng = not na(lk_hi) ? lk_hi - lk_lo : na
-    table.cell(dbg, 0, 3, "Range",      text_color=color.white, text_size=size.small)
-    table.cell(dbg, 1, 3, str.tostring(rng, format.mintick),    text_color=color.white, text_size=size.small)
+    table.cell(dbg, 1, 4, str.tostring(rng,      format.mintick), text_color=color.white, text_size=size.small)
 
     color rsi_c = rsi_val > 50 ? color.lime : color.red
-    table.cell(dbg, 0, 4, "RSI(" + str.tostring(i_rsi_len) + ")", text_color=color.white, text_size=size.small)
-    table.cell(dbg, 1, 4, str.tostring(math.round(rsi_val, 2)) + (rsi_val > 50 ? " ▲" : " ▼"),
+    table.cell(dbg, 0, 5, "RSI(" + str.tostring(i_rsi_len) + ")", text_color=color.white, text_size=size.small)
+    table.cell(dbg, 1, 5, str.tostring(math.round(rsi_val, 2)) + (rsi_val > 50 ? " ▲" : " ▼"),
                text_color=rsi_c, text_size=size.small)
 
     color atr_c = atr_val > atr_thr ? color.lime : color.red
-    table.cell(dbg, 0, 5, "ATR(" + str.tostring(i_atr_len) + ")", text_color=color.white, text_size=size.small)
-    table.cell(dbg, 1, 5, str.tostring(atr_val, format.mintick),   text_color=atr_c,       text_size=size.small)
+    table.cell(dbg, 0, 6, "ATR(" + str.tostring(i_atr_len) + ")", text_color=color.white, text_size=size.small)
+    table.cell(dbg, 1, 6, str.tostring(atr_val, format.mintick),   text_color=atr_c,       text_size=size.small)
 
     float vol_pct = vol_ma > 0 ? math.round(volume / vol_ma * 100) : 0
     color vol_c   = volume > vol_ma ? color.lime : color.red
-    table.cell(dbg, 0, 6, "Vol / MA%",           text_color=color.white, text_size=size.small)
-    table.cell(dbg, 1, 6, str.tostring(vol_pct) + "%", text_color=vol_c, text_size=size.small)
+    table.cell(dbg, 0, 7, "Vol / MA%",              text_color=color.white, text_size=size.small)
+    table.cell(dbg, 1, 7, str.tostring(vol_pct) + "%", text_color=vol_c,    text_size=size.small)
 
-    table.cell(dbg, 0, 7, "Long Filters",  text_color=color.white, text_size=size.small)
-    table.cell(dbg, 1, 7, confirm_long  ? "✅ PASS" : "❌ FAIL",
+    table.cell(dbg, 0, 8, "Long Filters",  text_color=color.white, text_size=size.small)
+    table.cell(dbg, 1, 8, confirm_long  ? "✅ PASS" : "❌ FAIL",
                text_color=confirm_long  ? color.lime : color.red, text_size=size.small)
-
-    table.cell(dbg, 0, 8, "Short Filters", text_color=color.white, text_size=size.small)
-    table.cell(dbg, 1, 8, confirm_short ? "✅ PASS" : "❌ FAIL",
+    table.cell(dbg, 0, 9, "Short Filters", text_color=color.white, text_size=size.small)
+    table.cell(dbg, 1, 9, confirm_short ? "✅ PASS" : "❌ FAIL",
                text_color=confirm_short ? color.lime : color.red, text_size=size.small)
 
 //  END OF SCRIPT
