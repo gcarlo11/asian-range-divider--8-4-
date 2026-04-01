@@ -1,6 +1,6 @@
 // ╔══════════════════════════════════════════════════════════════════════════════╗
 // ║  ASIA RANGE DIVIDER  v6 — Breakout + Bounce Dual-Mode Engine               ║
-// ║  Pine Script v6  ·  Kalman Filter  ·  1-Bar Confirmation  ·  ADX Regime    ║
+// ║  Pine Script v6  ·  Dynamic Risk:Reward Enforcer                           ║
 // ╚══════════════════════════════════════════════════════════════════════════════╝
 
 //@version=6
@@ -15,25 +15,27 @@ bool   i_show_box   = input.bool(true,  "Show Session Box",                    g
 bool   i_show_hist  = input.bool(false, "Show Past Session History",           group=G_SESS)
 
 var string G_KF     = "🔬 Kalman Filter"
-float  i_kf_q       = input.float(0.01, "Process Noise Q (lower = smoother)",  group=G_KF, minval=0.0001, maxval=1.0, step=0.001, tooltip="Controls how quickly the filter adapts.\n0.001 = very smooth, 0.1 = reactive")
-float  i_kf_r       = input.float(1.0,  "Measurement Noise R (higher = smoother)", group=G_KF, minval=0.1, maxval=10.0, step=0.1, tooltip="How much to trust raw price vs KF estimate. Higher = smoother")
+float  i_kf_q       = input.float(0.01, "Process Noise Q (lower = smoother)",  group=G_KF, minval=0.0001, maxval=1.0, step=0.001)
+float  i_kf_r       = input.float(1.0,  "Measurement Noise R (higher = smoother)", group=G_KF, minval=0.1, maxval=10.0, step=0.1)
 
 var string G_SIG    = "⚙️ Signal Engine"
 bool   i_brk_on     = input.bool(true,  "Enable Breakout Signals",             group=G_SIG)
 bool   i_bnc_on     = input.bool(true,  "Enable Bounce / Reversal Signals",    group=G_SIG)
-int    i_brk_score  = input.int(3, "Breakout — min score (0–5)",               group=G_SIG, minval=0, maxval=5, tooltip="Breakout fires when this many of 5 factors pass.\n4-5 = strict, 3 = balanced, 2 = lenient")
-int    i_bnc_score  = input.int(3, "Bounce — min score (0–5)",                 group=G_SIG, minval=0, maxval=5, tooltip="Bounce fires when this many of 5 factors pass.\n3 = balanced for ranging markets")
+int    i_brk_score  = input.int(3, "Breakout — min score (0–5)",               group=G_SIG, minval=0, maxval=5)
+int    i_bnc_score  = input.int(3, "Bounce — min score (0–5)",                 group=G_SIG, minval=0, maxval=5)
 int    i_adx_len    = input.int(14,   "ADX Length",                            group=G_SIG, minval=1)
-float  i_adx_thr    = input.float(20.0, "ADX Trend Threshold",                 group=G_SIG, minval=5.0, step=1.0, tooltip="ADX > this = TRENDING (breakout mode favoured)\nADX < this = RANGING (bounce mode favoured)")
-float  i_body_ratio = input.float(0.45, "Min Body Ratio for breakout (0–1)",   group=G_SIG, minval=0.1, maxval=0.99, step=0.05, tooltip="Breakout candle body must be ≥ this fraction of its High-Low range.\nFilters narrow-body fakeout candles.")
-float  i_wick_ratio = input.float(0.35, "Min Wick Ratio for bounce (0–1)",     group=G_SIG, minval=0.1, maxval=0.99, step=0.05, tooltip="Bounce wick (rejection tail) must be ≥ this fraction of candle range.\n0.35 = wick at least 35% of High-Low span.")
+float  i_adx_thr    = input.float(20.0, "ADX Trend Threshold",                 group=G_SIG, minval=5.0, step=1.0)
+float  i_body_ratio = input.float(0.45, "Min Body Ratio for breakout (0–1)",   group=G_SIG, minval=0.1, maxval=0.99, step=0.05)
+float  i_wick_ratio = input.float(0.35, "Min Wick Ratio for bounce (0–1)",     group=G_SIG, minval=0.1, maxval=0.99, step=0.05)
 int    i_vol_len    = input.int(20,   "Volume MA Length",                      group=G_SIG, minval=2)
-float  i_vol_z      = input.float(0.8, "Volume Z-Score Threshold",             group=G_SIG, minval=0.1, step=0.1, tooltip="Volume must be this many std-devs above its mean.\n0.8 = above average, 1.5 = strong surge only")
-float  i_pb_tol     = input.float(0.25, "Breakout pullback tolerance (× step)",group=G_SIG, minval=0.0, maxval=0.5, step=0.05, tooltip="After a breakout, how far back toward the level price can retrace (as a fraction of step size) and still confirm.\n0.25 = max 25% pullback allowed.")
+float  i_vol_z      = input.float(0.8, "Volume Z-Score Threshold",             group=G_SIG, minval=0.1, step=0.1)
+float  i_pb_tol     = input.float(0.25, "Breakout pullback tolerance (× step)",group=G_SIG, minval=0.0, maxval=0.5, step=0.05)
 
 var string G_TRADE  = "🎯 Trade Management"
-bool   i_lock_trade = input.bool(true, "Lock: no new signal until TP or SL hit", group=G_TRADE)
-bool   i_reset_sess = input.bool(true, "Reset trade lock on new session",        group=G_TRADE)
+float  i_rr         = input.float(1.0, "Risk:Reward Ratio Target",             group=G_TRADE, minval=0.5, step=0.1)
+bool   i_use_grid_tp= input.bool(false, "Use strict grid levels for TP",       group=G_TRADE)
+bool   i_lock_trade = input.bool(true, "Lock: no new signal until TP or SL",   group=G_TRADE)
+bool   i_reset_sess = input.bool(true, "Reset trade lock on new session",      group=G_TRADE)
 
 var string G_VIS    = "🎨 Visuals"
 bool   i_show_kf    = input.bool(true,  "Show Kalman Filter line",             group=G_VIS)
@@ -47,13 +49,13 @@ bool   asia_end   = not in_asia and     in_asia[1]
 
 var int t_open  = na
 var int t_close = na
-var int t_end   = na    // 03:00 AM GMT+7 next day = 20:00 UTC
+var int t_end   = na
 
 if asia_start
     t_open := time
 if asia_end
     t_close := time[1]
-    t_end   := int(t_close / 86400000) * 86400000 + 72000000   // floor-UTC-day + 20 h
+    t_end   := int(t_close / 86400000) * 86400000 + 72000000
 
 int bar_ms = timeframe.in_seconds() * 1000
 
@@ -69,11 +71,28 @@ else if in_asia
     sess_lo := math.min(sess_lo, low)
 
 //  L O C K E D   L E V E L S
-var float lk_hi = na, var float lk_lo = na, var float lk_step = na
-var float lv0 = na, var float lv1 = na, var float lv2 = na, var float lv3 = na, var float lv4 = na
-var float lv5 = na, var float lv6 = na, var float lv7 = na, var float lv8 = na
-var float ex_dn1 = na, var float ex_dn2 = na, var float ex_dn3 = na, var float ex_dn4 = na
-var float ex_up1 = na, var float ex_up2 = na, var float ex_up3 = na, var float ex_up4 = na
+var float lk_hi = na
+var float lk_lo = na
+var float lk_step = na
+
+var float lv0 = na
+var float lv1 = na
+var float lv2 = na
+var float lv3 = na
+var float lv4 = na
+var float lv5 = na
+var float lv6 = na
+var float lv7 = na
+var float lv8 = na
+
+var float ex_dn1 = na
+var float ex_dn2 = na
+var float ex_dn3 = na
+var float ex_dn4 = na
+var float ex_up1 = na
+var float ex_up2 = na
+var float ex_up3 = na
+var float ex_up4 = na
 
 if asia_end
     lk_hi   := sess_hi
@@ -81,10 +100,25 @@ if asia_end
     lk_step := (lk_hi - lk_lo) / 8.0
     float s  = lk_step
     
-    lv0 := lk_lo, lv1 := lk_lo + s, lv2 := lk_lo + s*2, lv3 := lk_lo + s*3, lv4 := lk_lo + s*4
-    lv5 := lk_lo + s*5, lv6 := lk_lo + s*6, lv7 := lk_lo + s*7, lv8 := lk_hi
-    ex_dn1 := lk_lo - s, ex_dn2 := lk_lo - s*2, ex_dn3 := lk_lo - s*3, ex_dn4 := lk_lo - s*4
-    ex_up1 := lk_hi + s, ex_up2 := lk_hi + s*2, ex_up3 := lk_hi + s*3, ex_up4 := lk_hi + s*4
+    lv0 := lk_lo
+    lv1 := lk_lo + s
+    lv2 := lk_lo + s*2
+    lv3 := lk_lo + s*3
+    lv4 := lk_lo + s*4
+    lv5 := lk_lo + s*5
+    lv6 := lk_lo + s*6
+    lv7 := lk_lo + s*7
+    lv8 := lk_hi
+    
+    ex_dn1 := lk_lo - s
+    ex_dn2 := lk_lo - s*2
+    ex_dn3 := lk_lo - s*3
+    ex_dn4 := lk_lo - s*4
+    
+    ex_up1 := lk_hi + s
+    ex_up2 := lk_hi + s*2
+    ex_up3 := lk_hi + s*3
+    ex_up4 := lk_hi + s*4
 
 f_flat_lvl(int fi) =>
     switch fi
@@ -108,11 +142,9 @@ f_flat_lvl(int fi) =>
         => float(na)
 
 f_flat_color(int fi) =>
-    fi >= 13 ? color.new(#880000, 0) : fi >= 10 ? color.new(#FF4444, 0) :
-      fi >= 7  ? color.new(#AAAAAA, 40): fi >= 4  ? color.new(#00CC66, 0) :
-      color.new(#004400, 0)
+    fi >= 13 ? color.new(#880000, 0) : fi >= 10 ? color.new(#FF4444, 0) : fi >= 7  ? color.new(#AAAAAA, 40) : fi >= 4  ? color.new(#00CC66, 0) : color.new(#004400, 0)
 
-//  K A L M A N   F I L T E R   (Alpha-Beta 2-state: position + velocity)
+//  K A L M A N   F I L T E R
 var float kf_price = close
 var float kf_vel   = 0.0
 var float kf_p     = 1.0
@@ -125,58 +157,42 @@ kf_price := kf_x_pred + kf_k * kf_innov
 kf_vel   := kf_vel    + kf_k * kf_innov
 kf_p     := (1.0 - kf_k) * kf_p_pred
 
-// ── KF direction booleans (current bar and 1 bar ago for setup-bar checks) ───
-bool kf_rising  = kf_vel > 0 and kf_vel >= kf_vel[1]   // trending up
-bool kf_falling = kf_vel < 0 and kf_vel <= kf_vel[1]   // trending down
-
-// For use on SETUP bar (bar[1]):
+bool kf_rising  = kf_vel > 0 and kf_vel >= kf_vel[1]
+bool kf_falling = kf_vel < 0 and kf_vel <= kf_vel[1]
 bool kf_was_rising  = kf_vel[1] > 0 and kf_vel[1] >= kf_vel[2]
 bool kf_was_falling = kf_vel[1] < 0 and kf_vel[1] <= kf_vel[2]
+bool kf_accel_up   = kf_vel > kf_vel[1] and kf_vel[1] > kf_vel[2]
+bool kf_accel_down = kf_vel < kf_vel[1] and kf_vel[1] < kf_vel[2]
 
-// ── KF velocity acceleration (for bounce: velocity turning, not just positive) ─
-bool kf_accel_up   = kf_vel > kf_vel[1] and kf_vel[1] > kf_vel[2]   // accelerating up
-bool kf_accel_down = kf_vel < kf_vel[1] and kf_vel[1] < kf_vel[2]   // accelerating down
-
-//  A D X   REGIME
+//  A D X  &  V O L U M E
 [_dip, _dim, adx_val] = ta.dmi(i_adx_len, i_adx_len)
 bool is_trending = adx_val > i_adx_thr
 bool is_ranging  = not is_trending
 
-//  V O L U M E   Z-SCORE
 float vol_mean = ta.sma(volume,  i_vol_len)
 float vol_std  = ta.stdev(volume, i_vol_len)
-float vol_z_now  = vol_std > 0 ? (volume   - vol_mean) / vol_std : 0.0
-float vol_z_prev = vol_std > 0 ? (volume[1] - vol_mean) / vol_std : 0.0  // setup bar
+float vol_z_prev = vol_std > 0 ? (volume[1] - vol_mean) / vol_std : 0.0
 
-//  C A N D L E   M E T R I C S   (current and setup-bar)
-float rng_now   = high   - low
 float rng_prev  = high[1] - low[1]
-float body_now  = math.abs(close   - open)
 float body_prev = math.abs(close[1] - open[1])
-
-// Body quality (for breakout)
 bool body_ok_prev = rng_prev > 0 and (body_prev / rng_prev) >= i_body_ratio
 
-// Wick quality for BOUNCE BUY
 float low_wick_prev  = math.min(close[1], open[1]) - low[1]
 float high_wick_prev = high[1] - math.max(close[1], open[1])
 bool  lo_wick_ok     = rng_prev > 0 and (low_wick_prev  / rng_prev) >= i_wick_ratio
 bool  hi_wick_ok     = rng_prev > 0 and (high_wick_prev / rng_prev) >= i_wick_ratio
 
-//  S E S S I O N   B O X
+//  S E S S I O N   B O X  &  L I N E S
 var box asia_box = na
 if i_show_box
     if asia_start
         box.delete(asia_box)
-        asia_box := box.new(left=t_open, top=sess_hi, right=time+bar_ms, bottom=sess_lo,
-                            xloc=xloc.bar_time, border_color=color.new(#FF9800,30),
-                            bgcolor=color.new(#FF9800,88), border_width=1)
+        asia_box := box.new(left=t_open, top=sess_hi, right=time+bar_ms, bottom=sess_lo, xloc=xloc.bar_time, border_color=color.new(#FF9800,30), bgcolor=color.new(#FF9800,88), border_width=1)
     if in_asia and not na(asia_box)
         box.set_right(asia_box, time+bar_ms)
         box.set_top(asia_box, sess_hi)
         box.set_bottom(asia_box, sess_lo)
 
-//  D R A W   L E V E L   L I N E S   &   L A B E L S
 var line[]  all_lines    = array.new_line()
 var label[] all_labels   = array.new_label()
 var label[] float_labels = array.new_label()
@@ -201,33 +217,8 @@ if asia_end
         color c      = f_flat_color(fi)
         bool  is_key = (fi==0 or fi==4 or fi==12 or fi==16)
 
-        string tag =
-             fi==16 ? "EXT+4 ▲▲ Strong Supply" : fi==15 ? "EXT+3 ▲ Supply Ext"      :
-             fi==14 ? "EXT+2 ▲ Supply Ext"     : fi==13 ? "EXT+1 ▲ Supply Ext"      :
-             fi==12 ? "L8 — Asia High ▲ Supply" : fi== 4 ? "L0 — Asia Low  ▼ Demand" :
-             fi== 3 ? "EXT-1 ▼ Demand Ext"      : fi== 2 ? "EXT-2 ▼ Demand Ext"      :
-             fi== 1 ? "EXT-3 ▼ Demand Ext"      : fi== 0 ? "EXT-4 ▼▼ Strong Demand"  :
-             fi>=10 ? "L"+str.tostring(fi-4)+" ▲ Supply" :
-             fi>= 7 ? "L"+str.tostring(fi-4)+" ● Mid"    :
-             "L"+str.tostring(fi-4)+" ▼ Demand"
-
-        line ln = line.new(x1=t_close, y1=lvl, x2=t_end, y2=lvl,
-                           xloc=xloc.bar_time, color=c,
-                           width=is_key?2:1,
-                           style=is_ext?line.style_dotted:is_key?line.style_solid:line.style_dashed)
+        line ln = line.new(x1=t_close, y1=lvl, x2=t_end, y2=lvl, xloc=xloc.bar_time, color=c, width=is_key?2:1, style=is_ext?line.style_dotted:is_key?line.style_solid:line.style_dashed)
         array.push(all_lines, ln)
-
-        label lb = label.new(x=t_close, y=lvl, text=tag, xloc=xloc.bar_time,
-                             color=color.new(c,80), textcolor=c,
-                             style=label.style_label_left, size=size.small)
-        array.push(all_labels, lb)
-        array.push(float_labels, lb)
-
-// Float current-session labels
-if array.size(float_labels) > 0 and barstate.islast
-    int fx = not na(t_end) ? math.min(time, t_end) : time
-    for lb in float_labels
-        label.set_x(lb, fx)
 
 //  T R A D E   S T A T E
 var bool  in_trade   = false
@@ -239,7 +230,7 @@ var line  sl_ln      = na
 
 if asia_start and i_reset_sess
     in_trade := false
-    strategy.close_all(comment="Session Close") // Strategy reset
+    strategy.close_all(comment="Session Close")
 
 bool tp_hit = false
 bool sl_hit = false
@@ -250,168 +241,113 @@ if in_trade
 
     if tp_hit or sl_hit
         in_trade := false
-        
         if not na(tp_ln)
             line.set_x2(tp_ln, time)
-            
         if not na(sl_ln)
             line.set_x2(sl_ln, time)
-            
-        float exit_p = tp_hit ? trade_tp : trade_sl
-        label.new(x=time, y=exit_p,
-                  text = (tp_hit?"✅ TP HIT\n":"❌ SL HIT\n") + str.tostring(exit_p,format.mintick),
-                  xloc=xloc.bar_time,
-                  color     = tp_hit ? color.new(#00AA44,55) : color.new(#CC0000,55),
-                  textcolor = tp_hit ? color.lime : color.red,
-                  style     = tp_hit ? label.style_label_upper_left : label.style_label_lower_left,
-                  size=size.small)
 
 //  S I G N A L   S C A N
 bool post_session = not in_asia and not na(lk_hi)
 bool can_enter    = not i_lock_trade or not in_trade
 
-// Outputs
-bool  brk_buy  = false
-bool  brk_sell = false
-bool  bnc_buy  = false
-bool  bnc_sell = false
-float sig_tp   = na
-float sig_sl   = na
-int   sig_fi   = -1
-int   sig_score = 0
-bool  sig_is_bounce = false
+bool brk_buy = false
+bool brk_sell = false
+bool bnc_buy = false
+bool bnc_sell = false
+float sig_tp = na
+float sig_sl = na
+int sig_score = 0
+bool sig_is_bounce = false
 
 if post_session and can_enter
-    // ── BREAKOUT BUY SCAN ────────────────────────────────────────────────────
+    // ── BREAKOUT BUY ─────────────────────────────────────────────────────────
     if i_brk_on and not brk_buy
         for fi = 0 to 16
             float lvl = f_flat_lvl(fi)
             if not na(lvl) and not na(lk_step)
-                bool setup_up = close[1] > lvl and close[2] <= lvl
-                float pb_limit = lvl - lk_step * i_pb_tol
-                bool  confirm_up = close > lvl and low >= pb_limit
-                
-                if setup_up and confirm_up
-                    bool b1 = kf_was_rising
-                    bool b2 = adx_val[1] > i_adx_thr
-                    bool b3 = open[1] < lvl                     
-                    bool b4 = body_ok_prev
-                    bool b5 = vol_z_prev >= i_vol_z
-                    int  sc  = (b1?1:0)+(b2?1:0)+(b3?1:0)+(b4?1:0)+(b5?1:0)
-                    
+                if close[1] > lvl and close[2] <= lvl and close > lvl and low >= (lvl - lk_step * i_pb_tol)
+                    int sc = (kf_was_rising?1:0) + (adx_val[1]>i_adx_thr?1:0) + (open[1]<lvl?1:0) + (body_ok_prev?1:0) + (vol_z_prev>=i_vol_z?1:0)
                     if sc >= i_brk_score
-                        float tp_c = fi < 16 ? f_flat_lvl(fi+1) : float(na)
-                        float sl_c = fi >  0 ? f_flat_lvl(fi-1) : float(na)
+                        float sl_c = fi > 0 ? f_flat_lvl(fi-1) : float(na)
+                        float grid_tp = fi < 16 ? f_flat_lvl(fi+1) : float(na)
+                        float tp_c = i_use_grid_tp ? grid_tp : (close + (close - sl_c) * i_rr)
                         if not na(tp_c) and not na(sl_c)
-                            brk_buy   := true
-                            sig_tp    := tp_c
-                            sig_sl    := sl_c
-                            sig_fi    := fi
+                            brk_buy := true
+                            sig_tp := tp_c
+                            sig_sl := sl_c
                             sig_score := sc
                             break
 
-    // ── BREAKOUT SELL SCAN ───────────────────────────────────────────────────
+    // ── BREAKOUT SELL ────────────────────────────────────────────────────────
     if i_brk_on and not brk_buy and not brk_sell
         for fi = 16 to 0
             float lvl = f_flat_lvl(fi)
             if not na(lvl) and not na(lk_step)
-                bool setup_dn = close[1] < lvl and close[2] >= lvl
-                float pb_limit = lvl + lk_step * i_pb_tol
-                bool  confirm_dn = close < lvl and high <= pb_limit
-                
-                if setup_dn and confirm_dn
-                    bool b1 = kf_was_falling
-                    bool b2 = adx_val[1] > i_adx_thr
-                    bool b3 = open[1] > lvl
-                    bool b4 = body_ok_prev
-                    bool b5 = vol_z_prev >= i_vol_z
-                    int  sc  = (b1?1:0)+(b2?1:0)+(b3?1:0)+(b4?1:0)+(b5?1:0)
-                    
+                if close[1] < lvl and close[2] >= lvl and close < lvl and high <= (lvl + lk_step * i_pb_tol)
+                    int sc = (kf_was_falling?1:0) + (adx_val[1]>i_adx_thr?1:0) + (open[1]>lvl?1:0) + (body_ok_prev?1:0) + (vol_z_prev>=i_vol_z?1:0)
                     if sc >= i_brk_score
-                        float tp_c = fi >  0 ? f_flat_lvl(fi-1) : float(na)
                         float sl_c = fi < 16 ? f_flat_lvl(fi+1) : float(na)
+                        float grid_tp = fi > 0 ? f_flat_lvl(fi-1) : float(na)
+                        float tp_c = i_use_grid_tp ? grid_tp : (close - (sl_c - close) * i_rr)
                         if not na(tp_c) and not na(sl_c)
-                            brk_sell  := true
-                            sig_tp    := tp_c
-                            sig_sl    := sl_c
-                            sig_fi    := fi
+                            brk_sell := true
+                            sig_tp := tp_c
+                            sig_sl := sl_c
                             sig_score := sc
                             break
 
-    // ── BOUNCE BUY SCAN ──────────────────────────────────────────────────────
+    // ── BOUNCE BUY ───────────────────────────────────────────────────────────
     if i_bnc_on and not brk_buy and not brk_sell and not bnc_buy
         for fi = 0 to 16
             float lvl = f_flat_lvl(fi)
             if not na(lvl) and not na(lk_step)
                 float tol = lk_step * 0.15    
-                bool wick_touch_sup  = low[1]   <= lvl + tol and close[1] > lvl
-                bool bullish_close   = close[1]  > open[1]
-                bool confirm_bounce  = close > close[1] and close > open   
-                
-                if wick_touch_sup and bullish_close and confirm_bounce
+                if low[1] <= lvl + tol and close[1] > lvl and close[1] > open[1] and close > close[1] and close > open
                     bool is_key = (fi==0 or fi==4 or fi==12 or fi==16)
-                    bool n1 = kf_accel_up
-                    bool n2 = is_ranging or is_key
-                    bool n3 = lo_wick_ok
-                    bool n4 = close[1] > lvl + tol             
-                    bool n5 = vol_z_prev >= i_vol_z * 0.5      
-                    int  sc  = (n1?1:0)+(n2?1:0)+(n3?1:0)+(n4?1:0)+(n5?1:0)
-                    
+                    int sc = (kf_accel_up?1:0) + ((is_ranging or is_key)?1:0) + (lo_wick_ok?1:0) + (close[1]>lvl+tol?1:0) + (vol_z_prev>=i_vol_z*0.5?1:0)
                     if sc >= i_bnc_score
-                        float tp_c = fi < 16 ? f_flat_lvl(fi+1) : float(na)
-                        float sl_c = fi >  0 ? f_flat_lvl(fi-1) : float(na)
+                        float sl_c = fi > 0 ? f_flat_lvl(fi-1) : float(na)
+                        float grid_tp = fi < 16 ? f_flat_lvl(fi+1) : float(na)
+                        float tp_c = i_use_grid_tp ? grid_tp : (close + (close - sl_c) * i_rr)
                         if not na(tp_c) and not na(sl_c)
-                            bnc_buy        := true
-                            sig_tp         := tp_c
-                            sig_sl         := sl_c
-                            sig_fi         := fi
-                            sig_score      := sc
-                            sig_is_bounce  := true
+                            bnc_buy := true
+                            sig_tp := tp_c
+                            sig_sl := sl_c
+                            sig_score := sc
+                            sig_is_bounce := true
                             break
 
-    // ── BOUNCE SELL SCAN ─────────────────────────────────────────────────────
+    // ── BOUNCE SELL ──────────────────────────────────────────────────────────
     if i_bnc_on and not brk_buy and not brk_sell and not bnc_buy and not bnc_sell
         for fi = 16 to 0 
             float lvl = f_flat_lvl(fi)
             if not na(lvl) and not na(lk_step)
                 float tol = lk_step * 0.15
-                bool wick_touch_res  = high[1]   >= lvl - tol and close[1] < lvl
-                bool bearish_close   = close[1]  < open[1]
-                bool confirm_bounce  = close < close[1] and close < open
-                
-                if wick_touch_res and bearish_close and confirm_bounce
+                if high[1] >= lvl - tol and close[1] < lvl and close[1] < open[1] and close < close[1] and close < open
                     bool is_key = (fi==0 or fi==4 or fi==12 or fi==16)
-                    bool n1 = kf_accel_down
-                    bool n2 = is_ranging or is_key
-                    bool n3 = hi_wick_ok
-                    bool n4 = close[1] < lvl - tol
-                    bool n5 = vol_z_prev >= i_vol_z * 0.5
-                    int  sc  = (n1?1:0)+(n2?1:0)+(n3?1:0)+(n4?1:0)+(n5?1:0)
-                    
+                    int sc = (kf_accel_down?1:0) + ((is_ranging or is_key)?1:0) + (hi_wick_ok?1:0) + (close[1]<lvl-tol?1:0) + (vol_z_prev>=i_vol_z*0.5?1:0)
                     if sc >= i_bnc_score
-                        float tp_c = fi >  0 ? f_flat_lvl(fi-1) : float(na)
                         float sl_c = fi < 16 ? f_flat_lvl(fi+1) : float(na)
+                        float grid_tp = fi > 0 ? f_flat_lvl(fi-1) : float(na)
+                        float tp_c = i_use_grid_tp ? grid_tp : (close - (sl_c - close) * i_rr)
                         if not na(tp_c) and not na(sl_c)
-                            bnc_sell       := true
-                            sig_tp         := tp_c
-                            sig_sl         := sl_c
-                            sig_fi         := fi
-                            sig_score      := sc
-                            sig_is_bounce  := true
+                            bnc_sell := true
+                            sig_tp := tp_c
+                            sig_sl := sl_c
+                            sig_score := sc
+                            sig_is_bounce := true
                             break
 
-// Unified buy/sell booleans for plotting
 bool buy_sig  = brk_buy  or bnc_buy
 bool sell_sig = brk_sell or bnc_sell
 
-// ── Activate trade on any signal ─────────────────────────────────────────────
+// ── Execute Trade ────────────────────────────────────────────────────────────
 if buy_sig or sell_sig
     in_trade   := true
     trade_long := buy_sig
     trade_tp   := sig_tp
     trade_sl   := sig_sl
     
-    // Strategy Execution
     if buy_sig
         strategy.entry("Long", strategy.long)
         strategy.exit("TP/SL Long", "Long", limit=trade_tp, stop=trade_sl)
@@ -421,92 +357,19 @@ if buy_sig or sell_sig
 
     line.delete(tp_ln)
     line.delete(sl_ln)
-    
     int le = not na(t_end) ? t_end : time + bar_ms * 300
-
-    tp_ln := line.new(x1=time, y1=sig_tp, x2=le, y2=sig_tp, xloc=xloc.bar_time,
-                      color=color.new(color.lime,35), style=line.style_dashed, width=1)
-    sl_ln := line.new(x1=time, y1=sig_sl, x2=le, y2=sig_sl, xloc=xloc.bar_time,
-                      color=color.new(color.red,35),  style=line.style_dashed, width=1)
+    tp_ln := line.new(x1=time, y1=sig_tp, x2=le, y2=sig_tp, xloc=xloc.bar_time, color=color.new(color.lime,35), style=line.style_dashed, width=1)
+    sl_ln := line.new(x1=time, y1=sig_sl, x2=le, y2=sig_sl, xloc=xloc.bar_time, color=color.new(color.red,35),  style=line.style_dashed, width=1)
 
     if i_show_score
-        string mode_tag  = sig_is_bounce ? " 🔄 BOUNCE" : " ⚡ BREAKOUT"
-        string score_bar = sig_score>=5?"●●●●●":sig_score==4?"●●●●○":sig_score==3?"●●●○○":sig_score==2?"●●○○○":"●○○○○"
-        string mkt_mode  = is_trending ? "TRENDING" : "RANGING"
-        float  step_size = not na(lk_step) ? lk_step : 0.0
-        
-        label.new(x         = time,
-                  y         = buy_sig ? low : high,
-                  text      = (buy_sig ? "🟢 BUY" : "🔴 SELL") + mode_tag +
-                              "\nTP → " + str.tostring(sig_tp, format.mintick) +
-                              "\nSL → " + str.tostring(sig_sl, format.mintick) +
-                              "\nRR 1:1 | step " + str.tostring(step_size, format.mintick) +
-                              "\nScore: " + score_bar + "  [" + mkt_mode + "]",
-                  xloc      = xloc.bar_time,
-                  color     = buy_sig ? color.new(#003300,55) : color.new(#330000,55),
-                  textcolor = buy_sig ? color.lime : color.red,
-                  style     = buy_sig ? label.style_label_upper_right : label.style_label_lower_right,
-                  size      = size.small)
+        string mode_tag = sig_is_bounce ? " 🔄 BOUNCE" : " ⚡ BREAKOUT"
+        string display_text = (buy_sig ? "🟢 BUY" : "🔴 SELL") + mode_tag + "\nTP → " + str.tostring(sig_tp, format.mintick) + "\nSL → " + str.tostring(sig_sl, format.mintick) + "\nRR " + str.tostring(i_rr) + ":1 Target"
+        label.new(x=time, y=buy_sig ? low : high, text=display_text, xloc=xloc.bar_time, color=buy_sig ? color.new(#003300,55) : color.new(#330000,55), textcolor=buy_sig ? color.lime : color.red, style=buy_sig ? label.style_label_upper_right : label.style_label_lower_right, size=size.small)
 
 //  P L O T S
-plot(i_show_kf ? kf_price : na, "Kalman Filter",
-     color     = kf_vel > 0 ? color.new(#00AAFF,50) : color.new(#FF6600,50),
-     linewidth = 1, style=plot.style_line)
-
+plot(i_show_kf ? kf_price : na, "Kalman Filter", color = kf_vel > 0 ? color.new(#00AAFF,50) : color.new(#FF6600,50), linewidth = 1)
 plotshape(brk_buy,  title="BUY Breakout",  location=location.belowbar, color=color.lime,  style=shape.triangleup,   size=size.normal)
 plotshape(brk_sell, title="SELL Breakout", location=location.abovebar, color=color.red,   style=shape.triangledown, size=size.normal)
-
 plotshape(bnc_buy,  title="BUY Bounce",    location=location.belowbar, color=color.new(#00FFCC,0), style=shape.circle, size=size.small)
 plotshape(bnc_sell, title="SELL Bounce",   location=location.abovebar, color=color.new(#FF88AA,0), style=shape.circle, size=size.small)
-
 bgcolor(is_ranging ? color.new(color.gray, 97) : na, title="Ranging Market Tint")
-
-//  A L E R T S
-alertcondition(brk_buy,  title="BUY Breakout",  message="BUY BREAKOUT confirmed — {{ticker}} {{interval}}")
-alertcondition(brk_sell, title="SELL Breakout", message="SELL BREAKOUT confirmed — {{ticker}} {{interval}}")
-alertcondition(bnc_buy,  title="BUY Bounce",    message="BUY BOUNCE (reversal) confirmed — {{ticker}} {{interval}}")
-alertcondition(bnc_sell, title="SELL Bounce",   message="SELL BOUNCE (reversal) confirmed — {{ticker}} {{interval}}")
-alertcondition(buy_sig,  title="Any BUY",       message="BUY signal (breakout or bounce) — {{ticker}} {{interval}}")
-alertcondition(sell_sig, title="Any SELL",      message="SELL signal (breakout or bounce) — {{ticker}} {{interval}}")
-alertcondition(tp_hit,   title="TP Hit",        message="✅ Take Profit hit — {{ticker}} {{interval}}")
-alertcondition(sl_hit,   title="SL Hit",        message="❌ Stop Loss hit — {{ticker}} {{interval}}")
-
-//  D E B U G   T A B L E
-var table dbg = table.new(position.top_right, 2, 16, bgcolor=color.new(color.black,65), border_color=color.new(color.gray,40), border_width=1)
-
-if barstate.islast and i_debug
-    table.cell(dbg,0,0,"📊 Signal State",text_color=color.yellow,text_size=size.small,bgcolor=color.new(#1A237E,40))
-    table.cell(dbg,1,0,"Value",           text_color=color.yellow,text_size=size.small,bgcolor=color.new(#1A237E,40))
-    table.cell(dbg,0, 1,"KF Velocity",   text_color=color.white,text_size=size.small)
-    table.cell(dbg,1, 1,str.tostring(math.round(kf_vel,6)), text_color=kf_vel>0?color.lime:color.red,text_size=size.small)
-    table.cell(dbg,0, 2,"KF Rising",     text_color=color.white,text_size=size.small)
-    table.cell(dbg,1, 2,kf_rising?"✅":"❌",text_color=kf_rising?color.lime:color.gray,text_size=size.small)
-    table.cell(dbg,0, 3,"KF Accel Up",   text_color=color.white,text_size=size.small)
-    table.cell(dbg,1, 3,kf_accel_up?"✅":"❌",text_color=kf_accel_up?color.lime:color.gray,text_size=size.small)
-    table.cell(dbg,0, 4,"ADX",           text_color=color.white,text_size=size.small)
-    table.cell(dbg,1, 4,str.tostring(math.round(adx_val,1))+" "+(is_trending?"📈 TREND":"↔️ RANGE"), text_color=is_trending?color.lime:color.orange,text_size=size.small)
-    table.cell(dbg,0, 5,"Vol Z (setup)", text_color=color.white,text_size=size.small)
-    table.cell(dbg,1, 5,str.tostring(math.round(vol_z_prev,2)), text_color=vol_z_prev>=i_vol_z?color.lime:color.gray,text_size=size.small)
-    table.cell(dbg,0, 6,"Body OK (prev)",text_color=color.white,text_size=size.small)
-    table.cell(dbg,1, 6,body_ok_prev?"✅":"❌",text_color=body_ok_prev?color.lime:color.gray,text_size=size.small)
-    table.cell(dbg,0, 7,"Lo Wick OK",   text_color=color.white,text_size=size.small)
-    table.cell(dbg,1, 7,lo_wick_ok?"✅":"❌",text_color=lo_wick_ok?color.lime:color.gray,text_size=size.small)
-    table.cell(dbg,0, 8,"Hi Wick OK",   text_color=color.white,text_size=size.small)
-    table.cell(dbg,1, 8,hi_wick_ok?"✅":"❌",text_color=hi_wick_ok?color.lime:color.gray,text_size=size.small)
-    table.cell(dbg,0, 9,"Asia High",     text_color=color.white,text_size=size.small)
-    table.cell(dbg,1, 9,str.tostring(lk_hi,format.mintick),text_color=color.red,text_size=size.small)
-    table.cell(dbg,0,10,"Asia Low",      text_color=color.white,text_size=size.small)
-    table.cell(dbg,1,10,str.tostring(lk_lo,format.mintick),text_color=color.lime,text_size=size.small)
-    table.cell(dbg,0,11,"Step Size",     text_color=color.white,text_size=size.small)
-    table.cell(dbg,1,11,str.tostring(lk_step,format.mintick),text_color=color.white,text_size=size.small)
-    table.cell(dbg,0,12,"In Trade",      text_color=color.white,text_size=size.small)
-    table.cell(dbg,1,12,in_trade?(trade_long?"🟢 LONG":"🔴 SHORT"):"—", text_color=in_trade?(trade_long?color.lime:color.red):color.gray,text_size=size.small)
-    table.cell(dbg,0,13,"Trade TP",      text_color=color.white,text_size=size.small)
-    table.cell(dbg,1,13,not na(trade_tp)?str.tostring(trade_tp,format.mintick):"—", text_color=color.lime,text_size=size.small)
-    table.cell(dbg,0,14,"Trade SL",      text_color=color.white,text_size=size.small)
-    table.cell(dbg,1,14,not na(trade_sl)?str.tostring(trade_sl,format.mintick):"—", text_color=color.red,text_size=size.small)
-    table.cell(dbg,0,15,"Last Signal",   text_color=color.white,text_size=size.small)
-    string last_sig_str = brk_buy?"⚡ BUY BRK":brk_sell?"⚡ SELL BRK":bnc_buy?"🔄 BUY BNC":bnc_sell?"🔄 SELL BNC":"—"
-    table.cell(dbg,1,15,last_sig_str,    text_color=color.yellow,text_size=size.small)
-
-//  END OF SCRIPT
